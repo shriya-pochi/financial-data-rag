@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+vector_db/
+.env
+*.xlsx
+*.xls
+*.pdf
+*.pptx
+*.csv

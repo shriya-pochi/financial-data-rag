@@ -1,0 +1,9 @@
+flask
+chromadb
+pandas
+numpy
+sentence-transformers
+PyPDF2
+python-pptx
+openpyxl
+google-genai
