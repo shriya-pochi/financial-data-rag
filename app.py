@@ -31,7 +31,7 @@ import threading
 import tempfile
 from collections import defaultdict, deque
 
-from flask import Flask, request, jsonify, session, render_template_string
+from flask import Flask, request, jsonify, session, render_template_string, Response, stream_with_context
 
 import chromadb
 
@@ -141,26 +141,61 @@ def api_chat():
         ctx_parts.append(retrieve_context(message, main_collection, embedder))
     context = "\n\n---\n\n".join(p for p in ctx_parts if p)
 
+    # These two short-circuit cases don't call the model at all, so there's
+    # nothing to stream — send them as a single plain-text response.
     if not context.strip():
         answer = (
             "There's nothing in the knowledge base yet to answer that from. "
             "Try uploading a sales report, deck, or spreadsheet."
         )
-    elif needs_clarification(message, context):
+        history.append({"user": message, "assistant": answer})
+        return Response(answer, mimetype="text/plain")
+
+    if needs_clarification(message, context):
         answer = (
             "I need a bit more to go on — could you name the file, sheet, "
             "metric, or time period you mean?"
         )
-    else:
-        prompt = build_prompt(message, context, history)
-        try:
-            resp = get_client().models.generate_content(model=GEMINI_MODEL, contents=prompt)
-            answer = resp.text
-        except Exception as e:
-            return jsonify({"error": f"Model call failed: {e}"}), 502
+        history.append({"user": message, "assistant": answer})
+        return Response(answer, mimetype="text/plain")
 
-    history.append({"user": message, "assistant": answer})
-    return jsonify({"answer": answer})
+    prompt = build_prompt(message, context, history)
+
+    def generate():
+        # Streams the answer to the browser as Gemini generates it, piece
+        # by piece, instead of buffering the whole thing server-side
+        # first. History still gets the complete assembled text once the
+        # stream ends — appended after the last yield, which Flask still
+        # executes before closing the response.
+        full_parts = []
+        try:
+            try:
+                stream = get_client().models.generate_content_stream(
+                    model=GEMINI_MODEL, contents=prompt
+                )
+            except AttributeError:
+                # Older/different google-genai SDK version without
+                # streaming support — fall back to one non-streamed chunk
+                # rather than breaking entirely.
+                resp = get_client().models.generate_content(model=GEMINI_MODEL, contents=prompt)
+                full_parts.append(resp.text or "")
+                yield resp.text or ""
+                history.append({"user": message, "assistant": "".join(full_parts)})
+                return
+
+            for chunk in stream:
+                piece = getattr(chunk, "text", None) or ""
+                if piece:
+                    full_parts.append(piece)
+                    yield piece
+        except Exception as e:
+            err = f"\n\nModel call failed: {e}"
+            full_parts.append(err)
+            yield err
+
+        history.append({"user": message, "assistant": "".join(full_parts)})
+
+    return Response(stream_with_context(generate()), mimetype="text/plain")
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -255,7 +290,12 @@ def handle_uncaught(e):
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    resp = jsonify({"status": "ok"})
+    # Scoped to this one endpoint only, so a portfolio shell on another
+    # subdomain can show a live/offline dot for this project without
+    # opening CORS up anywhere sensitive (chat/upload stay same-origin).
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
 
 
 # =========================
@@ -275,17 +315,19 @@ PAGE_HTML = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Revenue Desk — Sales &amp; Revenue Q&amp;A</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root{
-    --ink:#0E1421;
-    --panel:#161D2E;
-    --panel-2:#1E2740;
-    --brass:#C9A227;
-    --teal:#3FA796;
-    --text:#EDEFF4;
-    --muted:#8B93A7;
-    --line:#2B3550;
+    --ink:#070A12;
+    --panel:#0E1420;
+    --panel-2:#151D2E;
+    --line:#212A3D;
+    --text:#E7ECF5;
+    --muted:#828CA6;
+    --blue:#2F7DFF;
+    --blue-light:#6EB4FF;
+    --blue-deep:#123B82;
+    --blue-wash:rgba(47,125,255,0.08);
     --radius:14px;
   }
   *{box-sizing:border-box;}
@@ -293,62 +335,168 @@ PAGE_HTML = r"""
   body{
     margin:0;
     background:
-      radial-gradient(1200px 600px at 15% -10%, rgba(201,162,39,0.08), transparent 60%),
-      radial-gradient(900px 500px at 100% 0%, rgba(63,167,150,0.07), transparent 55%),
+      radial-gradient(1000px 560px at 85% -10%, var(--blue-wash), transparent 55%),
       var(--ink);
     color:var(--text);
     font-family:'Inter',sans-serif;
+  }
+
+  .app-shell{
+    display:grid;
+    grid-template-columns:300px 1fr;
+    height:100vh;
+  }
+
+  /* ===== sidebar ===== */
+  aside{
+    background:var(--panel);
+    border-right:1px solid var(--line);
     display:flex;
     flex-direction:column;
-    min-height:100vh;
+    overflow-y:auto;
   }
-  header{
-    padding:28px clamp(16px,4vw,48px) 10px;
+  .brand{
+    padding:26px 22px 20px;
+    border-bottom:1px solid var(--line);
+  }
+  .brand .mark{
+    font-family:'IBM Plex Mono',monospace;
+    color:var(--blue-light);
+    font-size:11px;
+    letter-spacing:.16em;
+    text-transform:uppercase;
+  }
+  .brand h1{
+    font-family:'Source Serif 4',serif;
+    font-weight:600;
+    font-size:22px;
+    margin:6px 0 4px;
+    letter-spacing:.01em;
+  }
+  .brand .tag{
+    font-size:12.5px;
+    color:var(--muted);
+    line-height:1.4;
+  }
+
+  .sb-section{padding:20px 22px;border-bottom:1px solid var(--line);}
+  .sb-section h2{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:11px;
+    letter-spacing:.1em;
+    text-transform:uppercase;
+    color:var(--muted);
+    margin:0 0 12px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+  }
+  .sb-section h2 .count{
+    color:var(--blue-light);
+    background:var(--blue-wash);
+    border-radius:6px;
+    padding:1px 7px;
+    font-size:11px;
+  }
+  .file-row{
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+    padding:9px 10px;
+    border-radius:9px;
+    margin-bottom:6px;
+    background:var(--panel-2);
+    border:1px solid var(--line);
+  }
+  .file-row .name{font-size:13px;word-break:break-word;}
+  .file-row .meta{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:10.5px;
+    color:var(--blue-light);
+  }
+  .file-empty{
+    color:var(--muted);
+    font-size:12.5px;
+    line-height:1.5;
+  }
+  .sb-upload{padding:18px 22px;margin-top:auto;}
+  .sb-upload-btn{
+    width:100%;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:8px;
+    padding:11px;
+    border-radius:10px;
+    border:1px dashed var(--line);
+    background:transparent;
+    color:var(--muted);
+    font-size:13px;
+    cursor:pointer;
+    transition:.15s;
+  }
+  .sb-upload-btn:hover{border-color:var(--blue);color:var(--blue-light);}
+  .sb-note{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:10.5px;
+    color:var(--muted);
+    text-align:center;
+    margin-top:10px;
+    line-height:1.5;
+  }
+  #file-input{display:none;}
+
+  /* ===== main chat column ===== */
+  .chat-main{
+    display:flex;
+    flex-direction:column;
+    height:100vh;
+    overflow:hidden;
+  }
+  .chat-header{
+    padding:22px clamp(16px,3vw,40px) 16px;
+    border-bottom:1px solid var(--line);
     display:flex;
     align-items:baseline;
     justify-content:space-between;
-    border-bottom:1px solid var(--line);
   }
-  .brand{display:flex;align-items:baseline;gap:10px;}
-  .brand .mark{
-    font-family:'IBM Plex Mono',monospace;
-    color:var(--brass);
-    font-size:13px;
-    letter-spacing:.14em;
-    border:1px solid var(--brass);
-    border-radius:4px;
-    padding:2px 6px;
-  }
-  h1{
-    font-family:'Fraunces',serif;
+  .chat-header .title{
+    font-family:'Source Serif 4',serif;
+    font-size:17px;
     font-weight:600;
-    font-size:clamp(20px,2.6vw,28px);
-    margin:0;
-    letter-spacing:.01em;
   }
-  .tag{
+  .chat-header .status{
     font-family:'IBM Plex Mono',monospace;
+    font-size:11px;
     color:var(--muted);
-    font-size:12px;
+    display:flex;
+    align-items:center;
+    gap:6px;
   }
-  main{
+  .chat-header .status .dot{
+    width:6px;height:6px;border-radius:50%;
+    background:var(--blue);
+    box-shadow:0 0 6px rgba(47,125,255,0.7);
+  }
+
+  #thread{
     flex:1;
-    width:100%;
-    max-width:860px;
-    margin:0 auto;
-    padding:24px clamp(12px,4vw,24px) 140px;
+    overflow-y:auto;
+    padding:28px clamp(16px,3vw,40px);
     display:flex;
     flex-direction:column;
     gap:18px;
   }
   .empty{
-    margin-top:10vh;
+    margin:auto;
     text-align:center;
     color:var(--muted);
+    max-width:420px;
   }
   .empty .big{
-    font-family:'Fraunces',serif;
-    font-size:clamp(22px,3.4vw,34px);
+    font-family:'Source Serif 4',serif;
+    font-weight:600;
+    font-size:clamp(22px,3vw,30px);
     color:var(--text);
     margin-bottom:10px;
   }
@@ -356,8 +504,8 @@ PAGE_HTML = r"""
     display:flex;
     flex-direction:column;
     gap:8px;
-    max-width:82%;
-    animation:rise .35s ease both;
+    max-width:74%;
+    animation:rise .3s ease both;
   }
   @keyframes rise{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
   .msg.user{align-self:flex-end;align-items:flex-end;}
@@ -365,40 +513,59 @@ PAGE_HTML = r"""
   .bubble{
     padding:13px 16px;
     border-radius:var(--radius);
-    line-height:1.5;
-    font-size:15px;
+    line-height:1.55;
+    font-size:14.5px;
     white-space:pre-wrap;
   }
   .msg.user .bubble{
-    background:var(--panel-2);
-    border:1px solid var(--line);
+    background:var(--blue-deep);
+    border:1px solid var(--blue);
     border-bottom-right-radius:4px;
   }
   .msg.bot .bubble{
-    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    background:var(--panel-2);
     border:1px solid var(--line);
     border-bottom-left-radius:4px;
   }
-  /* signature element: the ledger receipt strip under bot answers,
-     torn/dashed like a paper tape printout of the sources cited */
+  /* signature element: a slim "data trace" readout under single-fact
+     answers — a technical citation line, not a decorative flourish */
   .receipt{
     font-family:'IBM Plex Mono',monospace;
     font-size:11.5px;
-    color:var(--teal);
-    background:rgba(63,167,150,0.06);
-    border:1px dashed rgba(63,167,150,0.45);
-    border-radius:8px;
+    color:var(--blue-light);
+    background:var(--blue-wash);
+    border:1px solid rgba(47,125,255,0.3);
+    border-left:2px solid var(--blue);
+    border-radius:0 8px 8px 0;
     padding:8px 12px;
     max-width:100%;
   }
   .receipt .lbl{
-    color:var(--brass);
+    color:var(--blue-light);
     letter-spacing:.12em;
+    opacity:.75;
     margin-right:6px;
   }
-  .typing{
-    display:flex;gap:4px;padding:14px 16px;
+  .bubble p{margin:0 0 10px;}
+  .bubble p:last-child{margin-bottom:0;}
+  .bubble ul,.bubble ol{margin:0 0 10px;padding-left:20px;}
+  .bubble li{margin-bottom:4px;}
+  .bubble strong{color:var(--text);font-weight:600;}
+  .bubble h1,.bubble h2,.bubble h3,.bubble h4{
+    font-family:'Source Serif 4',serif;
+    font-weight:600;
+    font-size:15px;
+    margin:14px 0 6px;
   }
+  .bubble h1:first-child,.bubble h2:first-child,.bubble h3:first-child{margin-top:0;}
+  .bubble code{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:12.5px;
+    background:rgba(255,255,255,0.06);
+    padding:1px 5px;
+    border-radius:4px;
+  }
+  .typing{display:flex;gap:4px;padding:14px 16px;}
   .typing span{
     width:6px;height:6px;border-radius:50%;
     background:var(--muted);
@@ -408,21 +575,18 @@ PAGE_HTML = r"""
   .typing span:nth-child(3){animation-delay:.3s;}
   @keyframes blink{0%,80%,100%{opacity:.25;}40%{opacity:1;}}
 
-  footer{
-    position:fixed;bottom:0;left:0;right:0;
-    background:linear-gradient(180deg, transparent, var(--ink) 30%);
-    padding:18px clamp(12px,4vw,24px) 22px;
+  .composer-wrap{
+    padding:16px clamp(16px,3vw,40px) 22px;
+    border-top:1px solid var(--line);
   }
   .composer{
-    max-width:860px;margin:0 auto;
-    background:var(--panel);
+    background:var(--panel-2);
     border:1px solid var(--line);
     border-radius:16px;
     padding:8px 8px 8px 16px;
     display:flex;
     align-items:center;
     gap:8px;
-    box-shadow:0 12px 30px rgba(0,0,0,0.35);
   }
   .composer input[type=text]{
     flex:1;
@@ -431,25 +595,13 @@ PAGE_HTML = r"""
     outline:none;
     color:var(--text);
     font-family:'Inter',sans-serif;
-    font-size:15px;
+    font-size:14.5px;
     padding:10px 0;
   }
   .composer input[type=text]::placeholder{color:var(--muted);}
-  .icon-btn{
-    width:38px;height:38px;
-    border-radius:10px;
-    border:1px solid var(--line);
-    background:var(--panel-2);
-    color:var(--muted);
-    display:flex;align-items:center;justify-content:center;
-    cursor:pointer;
-    transition:.15s;
-    flex-shrink:0;
-  }
-  .icon-btn:hover{border-color:var(--brass);color:var(--brass);}
   .send-btn{
-    background:var(--brass);
-    color:#1a1405;
+    background:var(--blue);
+    color:#04101F;
     border:none;
     font-weight:600;
     font-family:'Inter',sans-serif;
@@ -460,18 +612,12 @@ PAGE_HTML = r"""
     flex-shrink:0;
     transition:.15s;
   }
-  .send-btn:hover{filter:brightness(1.08);}
+  .send-btn:hover{filter:brightness(1.1);}
   .send-btn:disabled{opacity:.5;cursor:default;}
-  #file-input{display:none;}
-  .upload-note{
-    max-width:860px;margin:8px auto 0;
-    font-family:'IBM Plex Mono',monospace;
-    font-size:11px;color:var(--muted);
-    text-align:center;
-  }
+
   .toast{
     position:fixed;top:18px;left:50%;transform:translateX(-50%);
-    background:var(--panel-2);border:1px solid var(--line);
+    background:var(--panel-2);border:1px solid var(--blue);
     padding:10px 16px;border-radius:10px;font-size:13px;
     color:var(--text);opacity:0;transition:opacity .25s;
     z-index:10;pointer-events:none;
@@ -480,118 +626,76 @@ PAGE_HTML = r"""
   @media (prefers-reduced-motion: reduce){
     .msg,.typing span{animation:none;}
   }
-  .tabs{display:flex;gap:6px;}
-  .tab{
-    font-family:'IBM Plex Mono',monospace;
-    font-size:12px;
-    letter-spacing:.06em;
-    background:transparent;
-    border:1px solid var(--line);
-    color:var(--muted);
-    padding:7px 14px;
-    border-radius:8px;
-    cursor:pointer;
-    transition:.15s;
-  }
-  .tab:hover{color:var(--text);}
-  .tab.active{
-    color:var(--brass);
-    border-color:var(--brass);
-    background:rgba(201,162,39,0.08);
-  }
-  #files-view{display:none;}
-  .file-section{margin-bottom:28px;}
-  .file-section h2{
-    font-family:'Fraunces',serif;
-    font-weight:600;
-    font-size:16px;
-    margin:0 0 4px;
-  }
-  .file-section .sub{
-    font-family:'IBM Plex Mono',monospace;
-    font-size:11.5px;
-    color:var(--muted);
-    margin-bottom:12px;
-  }
-  .file-row{
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:12px;
-    padding:12px 14px;
-    background:var(--panel);
-    border:1px solid var(--line);
-    border-radius:10px;
-    margin-bottom:8px;
-  }
-  .file-row .name{font-size:14px;}
-  .file-row .meta{
-    font-family:'IBM Plex Mono',monospace;
-    font-size:11px;
-    color:var(--teal);
-    white-space:nowrap;
-  }
-  .file-empty{
-    color:var(--muted);
-    font-size:13px;
-    padding:20px 4px;
+  @media (max-width:760px){
+    .app-shell{grid-template-columns:1fr;}
+    aside{
+      position:fixed;inset:0 auto 0 0;width:280px;
+      transform:translateX(-100%);
+      transition:transform .2s;
+      z-index:20;
+    }
+    aside.open{transform:translateX(0);}
   }
 </style>
 </head>
 <body>
 
-<header>
-  <div class="brand">
-    <span class="mark">RD</span>
-    <div>
-      <h1>Revenue Desk</h1>
-      <div class="tag">sales &amp; revenue Q&amp;A, answers cited to the row</div>
+<div class="app-shell">
+
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="mark">Revenue Desk</div>
+      <h1>Sales &amp; revenue intelligence</h1>
+      <div class="tag">Answers cited to the row, sourced from your own reports.</div>
+    </div>
+
+    <div class="sb-section">
+      <h2>Knowledge base <span class="count" id="library-count">—</span></h2>
+      <div id="library-files"><div class="file-empty">Loading…</div></div>
+    </div>
+
+    <div class="sb-section" style="border-bottom:none;">
+      <h2>This session <span class="count" id="session-count">—</span></h2>
+      <div id="session-files"><div class="file-empty">Loading…</div></div>
+    </div>
+
+    <div class="sb-upload">
+      <button class="sb-upload-btn" id="upload-btn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/></svg>
+        Upload a report
+      </button>
+      <input type="file" id="file-input" accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv">
+      <div class="sb-note">Private to this session, never saved permanently.</div>
+    </div>
+  </aside>
+
+  <div class="chat-main">
+    <div class="chat-header">
+      <div class="title">Ask about your numbers</div>
+      <div class="status"><span class="dot"></span>Connected</div>
+    </div>
+
+    <div id="thread">
+      <div class="empty" id="empty-state">
+        <div class="big">Ask it about the numbers.</div>
+        <div>Try &ldquo;what was Q3 revenue by region?&rdquo; or upload a report from the sidebar.</div>
+      </div>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer">
+        <input type="text" id="msg-input" placeholder="Ask about revenue, pipeline, quota…" autocomplete="off">
+        <button class="send-btn" id="send-btn">Ask</button>
+      </div>
     </div>
   </div>
-  <div class="tabs">
-    <button class="tab active" id="tab-chat" data-view="chat">Chat</button>
-    <button class="tab" id="tab-files" data-view="files">Files</button>
-  </div>
-</header>
 
-<main>
-<div id="chat-view">
-<div id="thread">
-  <div class="empty" id="empty-state">
-    <div class="big">Ask it about the numbers.</div>
-    <div>Try &ldquo;what was Q3 revenue by region?&rdquo; or upload a report below.</div>
-  </div>
 </div>
-</div>
-
-<div id="files-view">
-  <div class="file-section">
-    <h2>Knowledge base</h2>
-    <div class="sub">Permanently ingested, shared with every visitor</div>
-    <div id="library-files"><div class="file-empty">Loading…</div></div>
-  </div>
-  <div class="file-section">
-    <h2>This session</h2>
-    <div class="sub">Only visible to you, cleared when your session ends</div>
-    <div id="session-files"><div class="file-empty">Loading…</div></div>
-  </div>
-</div>
-</main>
 
 <div class="toast" id="toast"></div>
 
-<footer>
-  <div class="composer">
-    <div class="icon-btn" id="upload-btn" title="Upload a PDF, deck, or spreadsheet">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/></svg>
-    </div>
-    <input type="file" id="file-input" accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv">
-    <input type="text" id="msg-input" placeholder="Ask about revenue, pipeline, quota…" autocomplete="off">
-    <button class="send-btn" id="send-btn">Ask</button>
-  </div>
-  <div class="upload-note">Uploads are private to this session and never saved permanently.</div>
-</footer>
-
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 <script>
 const thread = document.getElementById('thread');
 const emptyState = document.getElementById('empty-state');
@@ -605,6 +709,12 @@ function showToast(text){
   toast.textContent = text;
   toast.classList.add('show');
   setTimeout(()=>toast.classList.remove('show'), 2600);
+}
+
+function escapeHtml(s){
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
 }
 
 function addMessage(role, text, sources){
@@ -622,22 +732,16 @@ function addMessage(role, text, sources){
     wrap.appendChild(r);
   }
   thread.appendChild(wrap);
-  window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
+  thread.scrollTop = thread.scrollHeight;
   return wrap;
 }
 
-function addTyping(){
-  const wrap = document.createElement('div');
-  wrap.className = 'msg bot';
-  wrap.id = 'typing-indicator';
-  wrap.innerHTML = '<div class="bubble typing"><span></span><span></span><span></span></div>';
-  thread.appendChild(wrap);
-  window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
-}
-
-function removeTyping(){
-  const el = document.getElementById('typing-indicator');
-  if (el) el.remove();
+function renderMarkdown(el, text){
+  try{
+    el.innerHTML = DOMPurify.sanitize(marked.parse(text));
+  }catch(e){
+    el.textContent = text;
+  }
 }
 
 // Pull a trailing "Source: ..." line out of the answer text so it can
@@ -663,7 +767,19 @@ async function sendMessage(){
   addMessage('user', text);
   input.value = '';
   sendBtn.disabled = true;
-  addTyping();
+
+  emptyState.style.display = 'none';
+  const botWrap = document.createElement('div');
+  botWrap.className = 'msg bot';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble typing';
+  bubble.innerHTML = '<span></span><span></span><span></span>';
+  botWrap.appendChild(bubble);
+  thread.appendChild(botWrap);
+  thread.scrollTop = thread.scrollHeight;
+
+  let full = '';
+  let firstChunk = true;
 
   try{
     const res = await fetch('/api/chat', {
@@ -671,17 +787,47 @@ async function sendMessage(){
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({message: text})
     });
-    const data = await res.json();
-    removeTyping();
+
     if (!res.ok){
-      addMessage('bot', data.error || 'Something went wrong.');
-    } else {
-      const {body, sources} = splitSources(data.answer || '');
-      addMessage('bot', body, sources);
+      let data = {};
+      try{ data = await res.json(); }catch(e){}
+      bubble.className = 'bubble';
+      bubble.textContent = data.error || 'Something went wrong.';
+      return;
     }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true){
+      const {done, value} = await reader.read();
+      if (done) break;
+      const piece = decoder.decode(value, {stream: true});
+      if (!piece) continue;
+      if (firstChunk){
+        bubble.className = 'bubble';
+        bubble.textContent = '';
+        firstChunk = false;
+      }
+      full += piece;
+      bubble.textContent = full;   // plain text while streaming, typewriter-style
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    // Once the full answer is in, swap to properly formatted markdown
+    // and peel off a single trailing citation into the receipt strip.
+    const {body, sources} = splitSources(full);
+    renderMarkdown(bubble, body);
+    if (sources){
+      const r = document.createElement('div');
+      r.className = 'receipt';
+      r.innerHTML = '<span class="lbl">SOURCE</span> ' + escapeHtml(sources);
+      botWrap.appendChild(r);
+    }
+    thread.scrollTop = thread.scrollHeight;
   }catch(e){
-    removeTyping();
-    addMessage('bot', 'Network error — try again.');
+    bubble.className = 'bubble';
+    bubble.textContent = 'Network error — try again.';
   }finally{
     sendBtn.disabled = false;
   }
@@ -711,32 +857,13 @@ fileInput.addEventListener('change', async () => {
       showToast(data.error || 'Upload failed.');
     } else {
       showToast(file.name + ' indexed — ask away.');
-      if (document.getElementById('tab-files').classList.contains('active')) loadFiles();
+      loadFiles();
     }
   }catch(e){
     showToast('Upload failed — could not reach the server.');
   }
   fileInput.value = '';
 });
-
-// ---- Files tab ----
-const tabChat = document.getElementById('tab-chat');
-const tabFiles = document.getElementById('tab-files');
-const chatView = document.getElementById('chat-view');
-const filesView = document.getElementById('files-view');
-const footerEl = document.querySelector('footer');
-
-function switchTab(view){
-  const toFiles = view === 'files';
-  tabFiles.classList.toggle('active', toFiles);
-  tabChat.classList.toggle('active', !toFiles);
-  filesView.style.display = toFiles ? 'block' : 'none';
-  chatView.style.display = toFiles ? 'none' : 'block';
-  footerEl.style.display = toFiles ? 'none' : 'block';
-  if (toFiles) loadFiles();
-}
-tabChat.addEventListener('click', () => switchTab('chat'));
-tabFiles.addEventListener('click', () => switchTab('files'));
 
 function fmtTime(ts){
   if (!ts) return '';
@@ -746,11 +873,14 @@ function fmtTime(ts){
 async function loadFiles(){
   const libEl = document.getElementById('library-files');
   const sessEl = document.getElementById('session-files');
-  libEl.innerHTML = '<div class="file-empty">Loading…</div>';
-  sessEl.innerHTML = '<div class="file-empty">Loading…</div>';
+  const libCount = document.getElementById('library-count');
+  const sessCount = document.getElementById('session-count');
   try{
     const res = await fetch('/api/files');
     const data = await res.json();
+
+    libCount.textContent = data.library ? data.library.length : 0;
+    sessCount.textContent = data.session_files ? data.session_files.length : 0;
 
     libEl.innerHTML = data.library && data.library.length
       ? data.library.map(name => `<div class="file-row"><span class="name">${escapeHtml(name)}</span></div>`).join('')
@@ -758,18 +888,14 @@ async function loadFiles(){
 
     sessEl.innerHTML = data.session_files && data.session_files.length
       ? data.session_files.map(f => `<div class="file-row"><span class="name">${escapeHtml(f.filename)}</span><span class="meta">${f.chunks != null ? f.chunks + ' chunks · ' : ''}${fmtTime(f.uploaded_at)}</span></div>`).join('')
-      : '<div class="file-empty">You haven\'t uploaded anything this session.</div>';
+      : '<div class="file-empty">Nothing uploaded this session yet.</div>';
   }catch(e){
     libEl.innerHTML = '<div class="file-empty">Couldn\'t load files.</div>';
     sessEl.innerHTML = '';
   }
 }
 
-function escapeHtml(s){
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
+loadFiles();
 </script>
 </body>
 </html>
@@ -778,8 +904,9 @@ function escapeHtml(s){
 
 if __name__ == "__main__":
     # Local dev only. For a publicly viewable deploy, run behind gunicorn:
-    #   gunicorn -w 1 -b 0.0.0.0:8080 app:app
+    #   gunicorn -w 1 --threads 4 -b 0.0.0.0:8080 app:app
     # Keep -w 1 (one worker) unless you move rate limiting/session state
     # to something shared like Redis — separate workers don't share the
-    # in-memory dicts above.
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    # in-memory dicts above. threads>1 is what lets a slow streaming
+    # response not block other visitors' requests.
+    app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
